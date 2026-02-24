@@ -11,7 +11,6 @@ cudawindowfilter
 venv/
 
 # Benchmark results
-results/
 *.pgm
 
 # Build artifacts
