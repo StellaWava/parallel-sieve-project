@@ -12,9 +12,7 @@ venv/
 
 # Benchmark results
 results/
-*.png
 *.pgm
-*.csv
 
 # Build artifacts
 *.o
