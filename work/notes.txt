@@ -1,0 +1,406 @@
+New notes
+Naive Byte Array (No Optimizations)
+Array of size N+1
+1 byte per integer
+No segmentation
+
+Parallelize outer loop or marking
+Memory:
+~1 GB for N = 10⁹
+
+Purpose:
+Establish baseline
+Show memory bandwidth bottleneck
+
+g++ -O3 -march=native -std=c++17 -fopenmp work/openmpv1.cpp -o openmpv1
+
+
+PART 2 Odd-Only Byte
+Only store odds
+1 byte per odd
+~0.5 GB at N = 10⁹
+Parallel marking
+Purpose:
+Show 2× memory reduction
+Better cache locality
+Reduced runtime
+
+PART 3: Bit-Packed (No Segmentation)
+1 bit per odd
+~62.5 MB at N = 10⁹
+Parallel marking
+Purpose:
+Demonstrate huge memory bandwidth reduction
+Major speedup even before segmentation
+
+CORE COURSE: Segmented Bit-Packed
+Fixed segment size (e.g., 32MB)
+Reuse base primes
+Parallel over segments
+Purpose:
+Show scalability
+Show cache efficiency
+Required for N ≥ 10⁹
+
+
+Part 1b — MPI (Same Progression)
+You repeat the same four steps:
+Naive byte (distributed contiguous blocks)
+Odd-only byte
+Bit-packed
+Segmented bit-packed
+
+Important:
+MPI partitioning is by contiguous value range per rank.
+This gives you a very strong distributed memory comparison.
+
+mpicxx -O3 -march=native -std=c++17 work/mpiv1.cpp -o mpiv1 
+
+
+Part 1c — CUDA GPU
+Only:
+Segmented + Bit-Packed
+Reason:
+GPU naive version is meaningless due to bandwidth limits
+GPU memory smaller than RAM
+Assignment requires segmentation for large N
+You already have this implemented
+
+nvcc -O3 -std=c++17 work/cudagpu.cu -o cudagpu 
+nvcc -O3 -std=c++17 work/cudaprimemask.cu -o cudaprimemask
+nvcc -O3 -std=c++17 work/cudawindowfilter.cu -o cudawindowfilter
+
+nvcc -O3 -std=c++17 src/sieve_cuda.cu -o sieve_cuda
+nvcc -O3 -std=c++17 -ccbin g++ src/sieve_cuda.cu -o sieve_cuda
+
+
+You can explain in report:
+Earlier memory variants were not implemented on GPU because they are not representative of efficient accelerator programming and would artificially inflate memory traffic.
+
+That is defensible.
+Part 1d — Hybrid MPI + OpenMP
+Only:
+Segmented + Bit-Packed
+Structure:
+MPI partitions global range
+Each rank runs OpenMP across segments
+Same bit-packed segment logic
+This shows hierarchical parallelism:
+Node-level parallelism (OpenMP)
+Cluster-level parallelism (MPI)
+
+mpicxx -O3 -march=native -std=c++17 -fopenmp \
+work/hybridmpop.cpp \
+-o hybrid
+
+
+Modulo mask is a sampling/highlighting operator: it sparsifies the image by keeping pixels aligned with prime periods.
+Prime intensity window kernel is a true filter: it blends neighbors with weights shaped by prime radii, producing ring-biased smoothing/texture effects.
+Varying prime_count changes density of rings; smaller primes dominate early.
+
+
+//window filter code 1
+/*
+Creates synthetic image (same style as before)
+Builds a radial kernel where weights are boosted in narrow “windows” at radii tied to primes
+Applies 2D convolution on GPU
+*/
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <vector>
+#include <cmath>
+#include <random>
+#include <iostream>
+#include <algorithm>
+#include <cuda_runtime.h>
+
+#define CUDA_CHECK(call) do {                                 \
+    cudaError_t err = (call);                                  \
+    if (err != cudaSuccess) {                                  \
+        std::cerr << "CUDA error: " << cudaGetErrorString(err) \
+                  << " at " << __FILE__ << ":" << __LINE__     \
+                  << std::endl;                                \
+        std::exit(1);                                          \
+    }                                                          \
+} while(0)
+
+static void write_pgm(const char* path,
+                      const std::vector<uint8_t>& img,
+                      int W, int H)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) { perror("fopen"); std::exit(1); }
+    fprintf(f, "P5\n%d %d\n255\n", W, H);
+    fwrite(img.data(), 1, (size_t)W * H, f);
+    fclose(f);
+}
+
+static std::vector<int> primes_upto(int n)
+{
+    std::vector<char> is_prime(n + 1, 1);
+    if (n >= 0) is_prime[0] = 0;
+    if (n >= 1) is_prime[1] = 0;
+
+    for (int p = 2; p * p <= n; p++)
+        if (is_prime[p])
+            for (int x = p * p; x <= n; x += p)
+                is_prime[x] = 0;
+
+    std::vector<int> primes;
+    for (int i = 2; i <= n; i++)
+        if (is_prime[i]) primes.push_back(i);
+    return primes;
+}
+
+/*
+Prime-Intensity Window Kernel (radial):
+--------------------------------------
+Define a kernel K(dx,dy) based on r = sqrt(dx^2 + dy^2).
+
+"Prime intensity windows" means:
+    - pick a set of primes P
+    - for each prime p, define a narrow radial window around r ≈ p
+    - within that window, weight is boosted (or shaped)
+
+So kernel has ring-like bands at prime radii.
+
+Parameters:
+    Ksize: odd kernel size (e.g., 31)
+    primes: primes list
+    window: half-width of ring window in pixels (e.g., 0.6)
+    ring_gain: how much each ring contributes
+    base_sigma: smooth base Gaussian to keep kernel well-behaved
+
+Then normalize kernel to sum=1 (so it behaves like a smoothing filter).
+*/
+static std::vector<float> build_prime_window_kernel(
+    int Ksize,
+    const std::vector<int>& primes,
+    float window,
+    float ring_gain,
+    float base_sigma)
+{
+    int R = Ksize / 2;
+    std::vector<float> K((size_t)Ksize * Ksize, 0.0f);
+
+    auto gauss = [&](float x, float s) -> float {
+        return std::exp(-(x * x) / (2.0f * s * s));
+    };
+
+    float sum = 0.0f;
+
+    for (int dy = -R; dy <= R; dy++) {
+        for (int dx = -R; dx <= R; dx++) {
+            float r = std::sqrt(float(dx*dx + dy*dy));
+
+            // -------- PCAM-P (conceptual) --------
+            // Kernel design is independent per (dx,dy) entry.
+
+            // Base Gaussian (keeps kernel smooth / stable)
+            float w = gauss(r, base_sigma);
+
+            // Add prime "intensity windows" as ring bumps
+            for (int p : primes) {
+                // windowed bump around radius p:
+                // bump = exp(-((r-p)^2)/(2*window^2))
+                float bump = gauss(r - float(p), window);
+                w += ring_gain * bump;
+            }
+
+            K[(dy + R) * Ksize + (dx + R)] = w;
+            sum += w;
+        }
+    }
+
+    // Normalize sum to 1 (proper filter kernel)
+    for (float& v : K) v /= sum;
+
+    return K;
+}
+
+/*
+CUDA convolution kernel (naive):
+--------------------------------
+PCAM inside this kernel:
+
+P: each output pixel (x,y) is an independent task
+C: no inter-thread comms (read-only input + kernel, write output)
+A: 2D blocks tile the image
+M: thread maps to pixel (x,y)
+
+MEM note:
+- input and output are row-major, coalesced on x dimension
+- kernel is small and read-only; we keep it in global memory here for simplicity
+  (you can move to constant memory later as an optimization)
+*/
+__global__ void conv2d_kernel(const uint8_t* img,
+                              uint8_t* out,
+                              int W, int H,
+                              const float* K,
+                              int Ksize)
+{
+    // -------- PCAM-M --------
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+
+    // -------- PCAM-P --------
+    // One thread computes one output pixel
+    int R = Ksize / 2;
+    float acc = 0.0f;
+
+    for (int ky = -R; ky <= R; ky++) {
+        int yy = y + ky;
+        yy = (yy < 0) ? 0 : (yy >= H ? H - 1 : yy); // clamp border
+
+        for (int kx = -R; kx <= R; kx++) {
+            int xx = x + kx;
+            xx = (xx < 0) ? 0 : (xx >= W ? W - 1 : xx);
+
+            float w = K[(ky + R) * Ksize + (kx + R)];
+            acc += w * float(img[yy * W + xx]);
+        }
+    }
+
+    // -------- PCAM-C --------
+    // Only global memory reads/writes; no sync needed.
+    int v = (int)lrintf(acc);
+    v = (v < 0) ? 0 : (v > 255 ? 255 : v);
+    out[y * W + x] = (uint8_t)v;
+}
+
+// Visualize kernel as PGM (scale to 0..255 for display)
+static std::vector<uint8_t> kernel_to_pgm(const std::vector<float>& K, int Ksize)
+{
+    float mn = K[0], mx = K[0];
+    for (float v : K) { mn = std::min(mn, v); mx = std::max(mx, v); }
+
+    std::vector<uint8_t> img((size_t)Ksize * Ksize);
+    for (int i = 0; i < Ksize * Ksize; i++) {
+        float t = (mx > mn) ? (K[i] - mn) / (mx - mn) : 0.0f;
+        int v = (int)lrintf(t * 255.0f);
+        v = std::max(0, std::min(255, v));
+        img[i] = (uint8_t)v;
+    }
+    return img;
+}
+
+int main(int argc, char** argv)
+{
+    // Usage:
+    // ./cuda_prime_intensity_window_filter W H Ksize prime_max prime_count seed
+    int W = (argc > 1) ? atoi(argv[1]) : 1024;
+    int H = (argc > 2) ? atoi(argv[2]) : 1024;
+    int Ksize = (argc > 3) ? atoi(argv[3]) : 31;          // must be odd
+    int prime_max = (argc > 4) ? atoi(argv[4]) : 29;      // primes used as radii
+    int prime_count = (argc > 5) ? atoi(argv[5]) : 8;
+    int seed = (argc > 6) ? atoi(argv[6]) : 123;
+
+    if (Ksize < 3 || (Ksize % 2) == 0) {
+        std::cerr << "Ksize must be odd and >= 3\n";
+        return 1;
+    }
+
+    // -------- PCAM-P --------
+    // Synthetic input generation (serial; not the focus)
+    std::vector<uint8_t> h_img((size_t)W * H);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> noise(0.0f, 10.0f);
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float val =
+                127.0f
+                + 60.0f * std::sin(2.0f * 3.14159265f * x / 64.0f)
+                + 40.0f * std::sin(2.0f * 3.14159265f * y / 96.0f)
+                + noise(rng);
+
+            int v = (int)lrintf(val);
+            v = std::max(0, std::min(255, v));
+            h_img[(size_t)y * W + x] = (uint8_t)v;
+        }
+    }
+
+    // Choose primes and build kernel
+    auto primes = primes_upto(prime_max);
+    if ((int)primes.size() > prime_count) primes.resize(prime_count);
+
+    // Ring/window parameters (tunable; keep simple for report)
+    float window = 0.6f;       // narrow ring width
+    float ring_gain = 0.15f;   // ring strength
+    float base_sigma = 6.0f;   // smooth base
+
+    // -------- MEM-OPT (design choice) --------
+    // Kernel size is small (Ksize^2 floats). Keep it compact and reuse it for all pixels.
+    auto h_K = build_prime_window_kernel(Ksize, primes, window, ring_gain, base_sigma);
+
+    // Visualize kernel as an image (for your report)
+    auto kimg = kernel_to_pgm(h_K, Ksize);
+
+    // -------- PCAM-C --------
+    // Allocate/copy data to GPU
+    uint8_t *d_img = nullptr, *d_out = nullptr;
+    float *d_K = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_img, (size_t)W * H));
+    CUDA_CHECK(cudaMalloc(&d_out, (size_t)W * H));
+    CUDA_CHECK(cudaMalloc(&d_K, (size_t)Ksize * Ksize * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_img, h_img.data(), (size_t)W * H, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_K, h_K.data(), (size_t)Ksize * Ksize * sizeof(float), cudaMemcpyHostToDevice));
+
+    // -------- PCAM-A --------
+    // Agglomerate pixels into 2D tiles
+    dim3 block(16, 16);
+    dim3 grid((W + block.x - 1) / block.x,
+              (H + block.y - 1) / block.y);
+
+    conv2d_kernel<<<grid, block>>>(d_img, d_out, W, H, d_K, Ksize);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Copy back
+    std::vector<uint8_t> h_out((size_t)W * H);
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, (size_t)W * H, cudaMemcpyDeviceToHost));
+
+    write_pgm("signal_input.pgm", h_img, W, H);
+    write_pgm("prime_window_kernel.pgm", kimg, Ksize, Ksize);
+    write_pgm("signal_prime_window_filtered.pgm", h_out, W, H);
+
+    std::cout << "Wrote: signal_input.pgm, prime_window_kernel.pgm, signal_prime_window_filtered.pgm\n";
+    std::cout << "Kernel primes (radii):";
+    for (int p : primes) std::cout << " " << p;
+    std::cout << "\n";
+    std::cout << "Interpretation: kernel has ring-like bands centered at prime radii; output is a prime-shaped smoothing filter.\n";
+
+    CUDA_CHECK(cudaFree(d_img));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_K));
+    return 0;
+}
+
+
+Anlysis part
+We will create:
+benchmark.sh 
+chmod +x benchmark.sh
+run
+./benchmark.sh
+→ runs all experiments and writes CSV files
+plot_results.py
+→ generates:
+
+speedup plot
+strong scaling plot
+weak scaling plot
+memory trend plot
+
+sudo apt update
+sudo apt install python3.10-venv
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install numpy pandas matplotlib
+python plot_results.py

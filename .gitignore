@@ -1,0 +1,24 @@
+# Compiled binaries
+openmpv*
+mpiv*
+hybrid
+cudagpu
+cudaprimemask
+cudawindowfilter
+*.out
+
+# Python virtual environment
+venv/
+
+# Benchmark results
+results/
+*.png
+*.pgm
+*.csv
+
+# Build artifacts
+*.o
+*.a
+
+# OS
+.DS_Store
